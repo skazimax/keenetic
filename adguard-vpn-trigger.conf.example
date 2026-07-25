@@ -1,0 +1,14 @@
+# Dedicated Keenetic WireGuard interface used only as an ON/OFF switch.
+# Replace this placeholder with the actual internal interface name.
+SWITCH_IF="REPLACE_WITH_INTERFACE_NAME"
+
+# Keenetic connection policy used only to select clients for AdGuard VPN.
+POLICY_NAME="Policy0"
+
+# Linux policy-routing table and rule priority.
+TABLE_ID="100"
+RULE_PRIORITY="90"
+
+# Persistent AdGuard VPN profile and polling interval in seconds.
+ADGUARD_HOME="/opt/home/adguardvpn"
+INTERVAL="60"
