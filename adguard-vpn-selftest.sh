@@ -18,7 +18,9 @@ export SSL_CERT_FILE="/opt/etc/ssl/certs/ca-certificates.crt"
 
 ERRORS=0
 WARNINGS=0
+VPN_CONNECTED=0
 RUN_CFG="/opt/var/run/adguardvpn-selftest.running-config"
+RUN_CFG_CACHE="/opt/var/run/adguardvpn-trigger/running-config.txt"
 
 ok() { echo "OK   $*"; }
 warn() { echo "WARN $*"; WARNINGS=$((WARNINGS + 1)); }
@@ -32,10 +34,26 @@ echo "switch=$SWITCH_IF policy=$POLICY_NAME table=$TABLE_ID priority=$RULE_PRIOR
 [ -x /opt/bin/opkg ] && ok "Entware is available" || fail "Entware is not available at /opt"
 if [ -x /opt/bin/adguardvpn-cli ]; then
     ok "AdGuard VPN CLI is installed"
-    if /opt/bin/adguardvpn-cli status >/opt/var/run/adguardvpn-selftest.cli-status 2>&1; then
-        ok "AdGuard VPN profile is initialized"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 20 /opt/bin/adguardvpn-cli status >/opt/var/run/adguardvpn-selftest.cli-status 2>&1
     else
-        warn "AdGuard VPN profile is not logged in or cannot be read from $ADGUARD_HOME"
+        /opt/bin/adguardvpn-cli status >/opt/var/run/adguardvpn-selftest.cli-status 2>&1 &
+        status_pid=$!
+        (sleep 20; kill "$status_pid" 2>/dev/null) &
+        watchdog_pid=$!
+        wait "$status_pid" 2>/dev/null || true
+        kill "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+    fi
+
+    if grep -qi 'not logged in' /opt/var/run/adguardvpn-selftest.cli-status; then
+        fail "AdGuard VPN profile is not logged in at $ADGUARD_HOME"
+    elif grep -qiE '^VPN is connected|^Connected to ' /opt/var/run/adguardvpn-selftest.cli-status; then
+        VPN_CONNECTED=1
+        ok "AdGuard VPN session is connected"
+    else
+        VPN_CONNECTED=0
+        warn "AdGuard VPN session is disconnected"
     fi
 else
     fail "AdGuard VPN CLI is missing"
@@ -57,8 +75,11 @@ else
 fi
 
 SWITCH_ON=0
-if ndmc -c show running-config > "$RUN_CFG" 2>/dev/null; then
+if ndmc -c "show running-config" > "$RUN_CFG" 2>/dev/null; then
     ok "Keenetic running-config is readable"
+elif [ -s "$RUN_CFG_CACHE" ]; then
+    cp "$RUN_CFG_CACHE" "$RUN_CFG"
+    warn "nested ndmc is unavailable; using the trigger running-config cache"
 else
     fail "cannot read Keenetic running-config"
     : > "$RUN_CFG"
@@ -97,6 +118,7 @@ else
 fi
 
 if [ "$SWITCH_ON" -eq 1 ]; then
+    [ "$VPN_CONNECTED" -eq 1 ] && ok "VPN session matches the enabled switch" || fail "switch is ON but VPN session is not connected"
     ip link show tun0 >/dev/null 2>&1 && ok "tun0 is up" || fail "switch is ON but tun0 is down"
     ip route show table "$TABLE_ID" 2>/dev/null | grep -q 'default.*tun0' && ok "VPN route table has a tun0 default route" || fail "VPN route table has no tun0 default route"
     ip rule show 2>/dev/null | grep -q "^$RULE_PRIORITY:.*lookup \($TABLE_ID\|adguardvpn\)" && ok "client policy rule is present" || warn "no client rule at priority $RULE_PRIORITY"

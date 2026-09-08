@@ -1,5 +1,12 @@
 #!/bin/sh
 
+if [ "${ADGUARD_TRIGGER_CLEAN_ENV:-0}" != "1" ]; then
+    exec env -i \
+        PATH=/opt/bin:/opt/sbin:/usr/bin:/bin:/usr/sbin:/sbin \
+        HOME=/ USER=root ADGUARD_TRIGGER_CLEAN_ENV=1 \
+        "$0" "$@"
+fi
+
 CONFIG_FILE="/opt/etc/adguard-vpn-trigger.conf"
 PIDFILE="/opt/var/run/adguard-vpn-trigger.pid"
 INTERVAL=60

@@ -28,6 +28,7 @@ DESIRED_FILE="$STATE_DIR/desired.clients"
 APPLIED_HASH_FILE="$STATE_DIR/applied.hash"
 RUN_CFG_FILE="$STATE_DIR/running-config.txt"
 DHCP_FILE="$STATE_DIR/dhcp-binding.txt"
+VPN_STATUS_FILE="$STATE_DIR/vpn.status"
 LOCK_DIR="/opt/var/run/adguardvpn-trigger.lock"
 
 VPN_CMD="/opt/bin/adguardvpn-cli"
@@ -68,7 +69,7 @@ require_tools() {
 load_running_config() {
     local tmp="$RUN_CFG_FILE.tmp"
 
-    if ndmc -c show running-config > "$tmp" 2>/dev/null; then
+    if ndmc -c "show running-config" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$RUN_CFG_FILE"
         return 0
     fi
@@ -102,6 +103,46 @@ is_tun_up() {
     ip link show tun0 >/dev/null 2>&1
 }
 
+load_vpn_status() {
+    local tmp="$VPN_STATUS_FILE.tmp"
+
+    run_with_timeout 20 "$VPN_CMD" status > "$tmp" 2>&1
+    rc=$?
+
+    mv "$tmp" "$VPN_STATUS_FILE"
+    return "$rc"
+}
+
+run_with_timeout() {
+    seconds="$1"
+    shift
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+        return $?
+    fi
+
+    "$@" &
+    command_pid=$!
+    (sleep "$seconds"; kill "$command_pid" 2>/dev/null) &
+    watchdog_pid=$!
+    wait "$command_pid"
+    rc=$?
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    return "$rc"
+}
+
+vpn_status_is_connected() {
+    [ -s "$VPN_STATUS_FILE" ] || return 1
+    grep -qiE '^VPN is connected|^Connected to ' "$VPN_STATUS_FILE"
+}
+
+vpn_status_is_logged_in() {
+    [ -s "$VPN_STATUS_FILE" ] || return 1
+    grep -qiE '^VPN is (connected|disconnected)|^Connected to ' "$VPN_STATUS_FILE"
+}
+
 disable_tun0_ipv6() {
     [ -e /proc/sys/net/ipv6/conf/tun0/disable_ipv6 ] && echo 1 > /proc/sys/net/ipv6/conf/tun0/disable_ipv6 2>/dev/null || true
     [ -e /proc/sys/net/ipv6/conf/tun0/autoconf ] && echo 0 > /proc/sys/net/ipv6/conf/tun0/autoconf 2>/dev/null || true
@@ -123,7 +164,7 @@ clean_all_vpn_ipv6() {
 load_dhcp_binding() {
     local tmp="$DHCP_FILE.tmp"
 
-    if ndmc -c show ip dhcp binding > "$tmp" 2>/dev/null; then
+    if ndmc -c "show ip dhcp binding" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$DHCP_FILE"
         return 0
     fi
@@ -223,25 +264,52 @@ cleanup_rules() {
 }
 
 ensure_vpn_connected() {
-    if is_tun_up; then
+    load_vpn_status || true
+
+    if is_tun_up && vpn_status_is_connected; then
         clean_all_vpn_ipv6
         return 0
     fi
 
-    log "tun0 is down, starting AdGuard VPN"
-    $VPN_CMD connect --yes --fastest </dev/null || return 1
+    if ! vpn_status_is_logged_in; then
+        log "AdGuard VPN is not logged in; interactive login is required"
+        return 1
+    fi
+
+    if is_tun_up; then
+        log "tun0 exists but AdGuard VPN is disconnected; resetting stale session"
+    else
+        log "AdGuard VPN is disconnected; starting a new session"
+    fi
+
+    cleanup_rules
+    run_with_timeout 15 "$VPN_CMD" disconnect >/dev/null 2>&1 || true
 
     i=0
-    while [ "$i" -lt 10 ]; do
-        if is_tun_up; then
-            clean_all_vpn_ipv6
-            return 0
-        fi
+    while is_tun_up && [ "$i" -lt 10 ]; do
         sleep 1
         i=$((i + 1))
     done
 
-    log "AdGuard VPN did not create tun0"
+    if ! run_with_timeout 30 "$VPN_CMD" connect --yes --fastest </dev/null; then
+        log "AdGuard VPN connect command failed or timed out"
+        return 1
+    fi
+
+    i=0
+    while [ "$i" -lt 20 ]; do
+        is_tun_up && break
+        sleep 1
+        i=$((i + 1))
+    done
+
+    load_vpn_status || true
+    if is_tun_up && vpn_status_is_connected; then
+        clean_all_vpn_ipv6
+        return 0
+    fi
+
+    log "AdGuard VPN did not reach connected state"
     return 1
 }
 
@@ -307,7 +375,7 @@ switch_off() {
 
     if [ -f "$STATE_FILE" ] || [ -f "$RULES_FILE" ] || is_tun_up; then
         cleanup_rules
-        $VPN_CMD disconnect >/dev/null 2>&1 || true
+        run_with_timeout 15 "$VPN_CMD" disconnect >/dev/null 2>&1 || true
         rm -f "$STATE_FILE" "$CLIENTS_FILE" "$CLIENTS_MAC_FILE" "$DESIRED_FILE"
         log "AdGuard VPN stopped"
     else
@@ -318,7 +386,13 @@ switch_off() {
 switch_on() {
     log "$SWITCH_IF switch is ON"
 
-    ensure_vpn_connected || return 1
+    if ! ensure_vpn_connected; then
+        cleanup_rules
+        run_with_timeout 15 "$VPN_CMD" disconnect >/dev/null 2>&1 || true
+        rm -f "$STATE_FILE" "$CLIENTS_FILE" "$CLIENTS_MAC_FILE" "$DESIRED_FILE"
+        log "VPN unavailable; policy clients left on the regular gateway"
+        return 1
+    fi
     build_desired_clients
 
     desired_hash=$(hash_file "$DESIRED_FILE")
@@ -339,7 +413,12 @@ switch_on() {
 }
 
 require_tools || exit 1
-load_running_config || exit 1
+if ! load_running_config; then
+    cleanup_rules
+    rm -f "$STATE_FILE" "$CLIENTS_FILE" "$CLIENTS_MAC_FILE" "$DESIRED_FILE"
+    log "Keenetic configuration unavailable; policy clients left on the regular gateway"
+    exit 1
+fi
 
 if is_vpn_switch_on; then
     switch_on
