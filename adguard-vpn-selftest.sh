@@ -8,6 +8,7 @@ POLICY_NAME="Policy0"
 TABLE_ID="100"
 RULE_PRIORITY="90"
 ADGUARD_HOME="/opt/home/adguardvpn"
+HEALTHCHECK_IP="1.1.1.1"
 
 if [ -r "$CONFIG_FILE" ]; then
     . "$CONFIG_FILE"
@@ -34,26 +35,27 @@ echo "switch=$SWITCH_IF policy=$POLICY_NAME table=$TABLE_ID priority=$RULE_PRIOR
 [ -x /opt/bin/opkg ] && ok "Entware is available" || fail "Entware is not available at /opt"
 if [ -x /opt/bin/adguardvpn-cli ]; then
     ok "AdGuard VPN CLI is installed"
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 20 /opt/bin/adguardvpn-cli status >/opt/var/run/adguardvpn-selftest.cli-status 2>&1
-    else
-        /opt/bin/adguardvpn-cli status >/opt/var/run/adguardvpn-selftest.cli-status 2>&1 &
-        status_pid=$!
-        (sleep 20; kill "$status_pid" 2>/dev/null) &
-        watchdog_pid=$!
-        wait "$status_pid" 2>/dev/null || true
-        kill "$watchdog_pid" 2>/dev/null || true
-        wait "$watchdog_pid" 2>/dev/null || true
-    fi
-
-    if grep -qi 'not logged in' /opt/var/run/adguardvpn-selftest.cli-status; then
-        fail "AdGuard VPN profile is not logged in at $ADGUARD_HOME"
-    elif grep -qiE '^VPN is connected|^Connected to ' /opt/var/run/adguardvpn-selftest.cli-status; then
+    if ip link show tun0 >/dev/null 2>&1 && ping -c 1 -W 3 -I tun0 "$HEALTHCHECK_IP" >/dev/null 2>&1; then
         VPN_CONNECTED=1
-        ok "AdGuard VPN session is connected"
+        ok "VPN traffic check through tun0 succeeded"
     else
-        VPN_CONNECTED=0
-        warn "AdGuard VPN session is disconnected"
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 20 /opt/bin/adguardvpn-cli status >/opt/var/run/adguardvpn-selftest.cli-status 2>&1
+        else
+            /opt/bin/adguardvpn-cli status >/opt/var/run/adguardvpn-selftest.cli-status 2>&1 &
+            status_pid=$!
+            (sleep 20; kill "$status_pid" 2>/dev/null) &
+            watchdog_pid=$!
+            wait "$status_pid" 2>/dev/null || true
+            kill "$watchdog_pid" 2>/dev/null || true
+            wait "$watchdog_pid" 2>/dev/null || true
+        fi
+
+        if grep -qi 'not logged in' /opt/var/run/adguardvpn-selftest.cli-status; then
+            fail "AdGuard VPN profile is not logged in at $ADGUARD_HOME"
+        else
+            warn "VPN traffic check through tun0 failed"
+        fi
     fi
 else
     fail "AdGuard VPN CLI is missing"
