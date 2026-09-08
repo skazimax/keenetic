@@ -11,4 +11,5 @@ RULE_PRIORITY="90"
 
 # Persistent AdGuard VPN profile and polling interval in seconds.
 ADGUARD_HOME="/opt/home/adguardvpn"
+HEALTHCHECK_IP="1.1.1.1"
 INTERVAL="60"
