@@ -68,7 +68,7 @@ ndmc -c 'show running-config' | awk '$1 == "interface" && $2 ~ /^Wireguard/ { pr
 Запустите на компьютере из этого каталога:
 
 ```sh
-cd /media/max/2tb/VScode/keenetic
+cd /path/to/keenetic
 
 # Замените значения на параметры своего роутера.
 ROUTER_ADDRESS="router-address"
@@ -250,6 +250,8 @@ RULE_PRIORITY="90"
 ADGUARD_HOME="/opt/home/adguardvpn"
 INTERVAL="60"
 ```
+
+Параметр `HEALTHCHECK_IP` задаёт внешний IPv4-адрес, отвечающий на ping через VPN. Он не должен совпадать с адресом самого роутера или локальной сети. При повторной установке сохраняйте выбранное значение: `install.sh` перезаписывает конфигурацию значениями установщика.
 
 После изменения выполните:
 
