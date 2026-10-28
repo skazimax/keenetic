@@ -8,7 +8,7 @@ POLICY_NAME="Policy0"
 TABLE_ID="100"
 RULE_PRIORITY="90"
 ADGUARD_HOME="/opt/home/adguardvpn"
-HEALTHCHECK_IP="1.1.1.1"
+HEALTHCHECK_URL="https://www.google.com/generate_204"
 
 if [ -r "$CONFIG_FILE" ]; then
     . "$CONFIG_FILE"
@@ -35,7 +35,7 @@ echo "switch=$SWITCH_IF policy=$POLICY_NAME table=$TABLE_ID priority=$RULE_PRIOR
 [ -x /opt/bin/opkg ] && ok "Entware is available" || fail "Entware is not available at /opt"
 if [ -x /opt/bin/adguardvpn-cli ]; then
     ok "AdGuard VPN CLI is installed"
-    if ip link show tun0 >/dev/null 2>&1 && ping -c 1 -W 3 -I tun0 "$HEALTHCHECK_IP" >/dev/null 2>&1; then
+    if ip link show tun0 >/dev/null 2>&1 && /opt/bin/curl -s -m 5 --interface tun0 -o /dev/null "$HEALTHCHECK_URL" 2>/dev/null; then
         VPN_CONNECTED=1
         ok "VPN traffic check through tun0 succeeded"
     else

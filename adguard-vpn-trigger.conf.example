@@ -11,5 +11,15 @@ RULE_PRIORITY="90"
 
 # Persistent AdGuard VPN profile and polling interval in seconds.
 ADGUARD_HOME="/opt/home/adguardvpn"
-HEALTHCHECK_IP="1.1.1.1"
-INTERVAL="60"
+# HTTPS URL fetched through tun0 in parallel to verify the tunnel.
+# ICMP is not usable: AdGuard answers ping locally.
+HEALTHCHECK_URL="https://www.google.com/generate_204"
+HEALTHCHECK_PARALLEL="4"
+
+# app.log is trimmed above this size; old tunnel.log.N copies are removed.
+ADGUARD_LOG_MAX_KB="1024"
+
+# AdGuard VPN protocols tried in order when a new session fails the check;
+# the one that worked last is tried first.
+PROTOCOLS="quic http2"
+INTERVAL="120"

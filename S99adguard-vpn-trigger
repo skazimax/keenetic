@@ -9,7 +9,7 @@ fi
 
 CONFIG_FILE="/opt/etc/adguard-vpn-trigger.conf"
 PIDFILE="/opt/var/run/adguard-vpn-trigger.pid"
-INTERVAL=60
+INTERVAL=120
 SCRIPT="/opt/scripts/adguard-vpn-trigger.sh"
 LOG="/opt/var/log/adguard-vpn-trigger.status"
 
@@ -44,6 +44,7 @@ start() {
     rm -f /opt/var/run/adguardvpn.clients
     rm -f /opt/var/run/adguardvpn.clients.new
     rmdir /opt/var/run/adguardvpn-trigger.lock 2>/dev/null || true
+    rmdir /opt/var/run/adguardvpn-trigger.pending 2>/dev/null || true
     touch "$LOG"
 
     (

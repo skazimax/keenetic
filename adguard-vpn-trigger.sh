@@ -1,6 +1,9 @@
 #!/opt/bin/sh
 
 export PATH="/opt/bin:/opt/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+# ndm hooks and Entware shells export Entware's library path; the firmware
+# ndmc binary then fails with "Cli::Main: failed to initialize".
+unset LD_LIBRARY_PATH LD_BIND_NOW
 
 CONFIG_FILE="/opt/etc/adguard-vpn-trigger.conf"
 
@@ -11,7 +14,10 @@ POLICY_NAME="Policy0"
 TABLE_ID="100"
 RULE_PRIORITY="90"
 ADGUARD_HOME="/opt/home/adguardvpn"
-HEALTHCHECK_IP="1.1.1.1"
+HEALTHCHECK_URL="https://www.google.com/generate_204"
+HEALTHCHECK_PARALLEL="4"
+ADGUARD_LOG_MAX_KB="1024"
+PROTOCOLS="quic http2"
 
 if [ -r "$CONFIG_FILE" ]; then
     . "$CONFIG_FILE"
@@ -30,6 +36,7 @@ APPLIED_HASH_FILE="$STATE_DIR/applied.hash"
 RUN_CFG_FILE="$STATE_DIR/running-config.txt"
 DHCP_FILE="$STATE_DIR/dhcp-binding.txt"
 VPN_STATUS_FILE="$STATE_DIR/vpn.status"
+PROTOCOL_FILE="$STATE_DIR/protocol"
 LOCK_DIR="/opt/var/run/adguardvpn-trigger.lock"
 
 VPN_CMD="/opt/bin/adguardvpn-cli"
@@ -104,9 +111,23 @@ is_tun_up() {
     ip link show tun0 >/dev/null 2>&1
 }
 
+# AdGuard answers ICMP on tun0 locally, so ping succeeds even when the tunnel
+# cannot open new connections. Check several parallel TCP/TLS requests instead.
 is_tun_healthy() {
     is_tun_up || return 1
-    ping -c 1 -W 3 -I tun0 "$HEALTHCHECK_IP" >/dev/null 2>&1
+
+    passed=$(
+        {
+            i=0
+            while [ "$i" -lt "$HEALTHCHECK_PARALLEL" ]; do
+                curl -s -m 5 --interface tun0 -o /dev/null -w '%{http_code}\n' "$HEALTHCHECK_URL" 2>/dev/null &
+                i=$((i + 1))
+            done
+            wait
+        } | grep -c '^[23]'
+    )
+
+    [ "$passed" -gt 0 ] && [ $((passed * 2)) -ge "$HEALTHCHECK_PARALLEL" ]
 }
 
 load_vpn_status() {
@@ -254,9 +275,30 @@ cleanup_rules() {
     clean_ip_rules
     clean_nat
     clean_forward_chain
-    clean_all_vpn_ipv6
     ip route flush table "$TABLE_ID" 2>/dev/null || true
     rm -f "$RULES_FILE" "$APPLIED_HASH_FILE"
+}
+
+teardown() {
+    cleanup_rules
+    stop_vpn_session
+    rm -f "$STATE_FILE" "$CLIENTS_FILE" "$CLIENTS_MAC_FILE" "$DESIRED_FILE"
+}
+
+# The CLI rotates tunnel.log at 10 MB keeping five copies and never trims
+# app.log; on internal flash that is ~60 MB of writes we do not need.
+trim_adguard_logs() {
+    local dir="$ADGUARD_HOME/.local/share/adguardvpn-cli"
+    local size
+
+    rm -f "$dir"/tunnel.log.[2-9]
+
+    [ -f "$dir/app.log" ] || return 0
+    size=$(wc -c < "$dir/app.log")
+    if [ "$size" -gt $((ADGUARD_LOG_MAX_KB * 1024)) ]; then
+        tail -n 2000 "$dir/app.log" > "$dir/app.log.tmp" && cat "$dir/app.log.tmp" > "$dir/app.log"
+        rm -f "$dir/app.log.tmp"
+    fi
 }
 
 stop_vpn_session() {
@@ -285,8 +327,11 @@ stop_vpn_session() {
 }
 
 ensure_vpn_connected() {
+    # In "auto" routing mode the CLI routes the whole router through tun0 via
+    # the main table; only table $TABLE_ID clients must use the tunnel.
+    clean_tun0_ipv4_main_routes
+
     if is_tun_healthy; then
-        clean_all_vpn_ipv6
         return 0
     fi
 
@@ -305,22 +350,48 @@ ensure_vpn_connected() {
         return 1
     fi
 
-    if ! run_with_timeout 30 "$VPN_CMD" connect --yes --fastest </dev/null; then
-        log "AdGuard VPN connect command failed or timed out"
+    # Start with the protocol that worked last time, then try the others.
+    tried=" "
+    for proto in $(cat "$PROTOCOL_FILE" 2>/dev/null) $PROTOCOLS; do
+        case "$tried" in *" $proto "*) continue ;; esac
+        tried="$tried$proto "
+
+        if connect_with_protocol "$proto"; then
+            echo "$proto" > "$PROTOCOL_FILE"
+            clean_all_vpn_ipv6
+            return 0
+        fi
+        stop_vpn_session
+    done
+
+    log "AdGuard VPN did not reach connected state with any of: $PROTOCOLS"
+    return 1
+}
+
+connect_with_protocol() {
+    log "Connecting AdGuard VPN using $1"
+
+    if ! run_with_timeout 15 "$VPN_CMD" config set-protocol "$1" >/dev/null 2>&1; then
+        log "Failed to set AdGuard VPN protocol $1"
         return 1
     fi
+
+    if ! run_with_timeout 30 "$VPN_CMD" connect --yes --fastest </dev/null; then
+        clean_tun0_ipv4_main_routes
+        log "AdGuard VPN connect command failed or timed out ($1)"
+        return 1
+    fi
+    clean_tun0_ipv4_main_routes
 
     i=0
     while [ "$i" -lt 10 ]; do
         sleep 2
-        if is_tun_healthy; then
-            clean_all_vpn_ipv6
-            return 0
-        fi
+        clean_tun0_ipv4_main_routes
+        is_tun_healthy && return 0
         i=$((i + 1))
     done
 
-    log "AdGuard VPN did not reach connected state"
+    log "AdGuard VPN traffic check failed ($1)"
     return 1
 }
 
@@ -350,7 +421,6 @@ apply_rules() {
         return 1
     fi
 
-    clean_all_vpn_ipv6
     clean_ip_rules
     clean_nat
     clean_forward_chain
@@ -369,11 +439,12 @@ apply_rules() {
         log "No resolved VPN clients; route table prepared, no client rules added"
     fi
 
+    $IPTABLES -t nat -A POSTROUTING -o tun0 -j MASQUERADE
+
     while read ipaddr; do
         [ -n "$ipaddr" ] || continue
         log "Adding VPN client: $ipaddr"
         ip rule add from "$ipaddr/32" table "$TABLE_ID" priority "$RULE_PRIORITY" 2>/dev/null || true
-        $IPTABLES -t nat -A POSTROUTING -s "$ipaddr/32" -o tun0 -j MASQUERADE
     done < "$DESIRED_FILE"
 
     clean_all_vpn_ipv6
@@ -385,9 +456,7 @@ switch_off() {
     log "$SWITCH_IF switch is OFF"
 
     if [ -f "$STATE_FILE" ] || [ -f "$RULES_FILE" ] || is_tun_up; then
-        cleanup_rules
-        stop_vpn_session
-        rm -f "$STATE_FILE" "$CLIENTS_FILE" "$CLIENTS_MAC_FILE" "$DESIRED_FILE"
+        teardown
         log "AdGuard VPN stopped"
     else
         log "Nothing to do"
@@ -398,9 +467,7 @@ switch_on() {
     log "$SWITCH_IF switch is ON"
 
     if ! ensure_vpn_connected; then
-        cleanup_rules
-        stop_vpn_session
-        rm -f "$STATE_FILE" "$CLIENTS_FILE" "$CLIENTS_MAC_FILE" "$DESIRED_FILE"
+        teardown
         log "VPN unavailable; policy clients left on the regular gateway"
         return 1
     fi
@@ -416,7 +483,6 @@ switch_on() {
         log "Client set changed, applying"
         apply_rules
     else
-        clean_all_vpn_ipv6
         log "VPN already ON, rules are up to date"
     fi
 
@@ -426,12 +492,12 @@ switch_on() {
 require_tools || exit 1
 
 if [ "${1:-run}" = "cleanup" ]; then
-    cleanup_rules
-    stop_vpn_session
-    rm -f "$STATE_FILE" "$CLIENTS_FILE" "$CLIENTS_MAC_FILE" "$DESIRED_FILE"
+    teardown
     log "AdGuard VPN stopped and routing state cleaned"
     exit 0
 fi
+
+trim_adguard_logs
 
 if ! load_running_config; then
     cleanup_rules

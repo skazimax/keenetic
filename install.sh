@@ -10,8 +10,18 @@ POLICY_NAME="Policy0"
 TABLE_ID="100"
 RULE_PRIORITY="90"
 ADGUARD_HOME="/opt/home/adguardvpn"
-HEALTHCHECK_IP="1.1.1.1"
-INTERVAL="60"
+HEALTHCHECK_URL="https://www.google.com/generate_204"
+HEALTHCHECK_PARALLEL="4"
+ADGUARD_LOG_MAX_KB="1024"
+PROTOCOLS="quic http2"
+INTERVAL="120"
+CONFIG_FILE="/opt/etc/adguard-vpn-trigger.conf"
+
+# A reinstall keeps the existing configuration; command-line options override it.
+if [ -r "$CONFIG_FILE" ]; then
+    . "$CONFIG_FILE"
+fi
+
 INSTALL_PACKAGES=1
 INSTALL_ADGUARD=1
 START_SERVICE=1
@@ -21,9 +31,10 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --switch NAME          Dedicated Keenetic UI switch interface (required)
-  --policy NAME          Keenetic client policy (default: Policy0)
-  --interval SECONDS     Polling interval (default: 60)
+  --switch NAME          Dedicated Keenetic UI switch interface
+                         (required unless already set in the existing config)
+  --policy NAME          Keenetic client policy (default: existing or Policy0)
+  --interval SECONDS     Polling interval (default: existing or 120)
   --skip-packages        Do not run opkg update/install
   --skip-adguard         Do not install AdGuard VPN CLI
   --no-start             Install files without starting the service
@@ -93,13 +104,13 @@ done
 
 [ "$(id -u)" = "0" ] || die "run this installer as root"
 [ -x /opt/bin/opkg ] || die "Entware is not mounted at /opt; install and start OPKG first"
-[ -n "$SWITCH_IF" ] || die "--switch is required"
+[ -n "$SWITCH_IF" ] || die "--switch is required (no SWITCH_IF in $CONFIG_FILE)"
 safe_name "$SWITCH_IF" || die "invalid switch interface name: $SWITCH_IF"
 safe_name "$POLICY_NAME" || die "invalid policy name: $POLICY_NAME"
 safe_number "$INTERVAL" || die "invalid interval: $INTERVAL"
 [ "$INTERVAL" -ge 15 ] || die "interval must be at least 15 seconds"
 
-for file in adguard-vpn-trigger.sh S99adguard-vpn-trigger adguard-vpn-selftest.sh; do
+for file in adguard-vpn-trigger.sh S99adguard-vpn-trigger adguard-vpn-selftest.sh ndm-hook.sh; do
     [ -f "$SCRIPT_DIR/$file" ] || die "missing deployment file: $SCRIPT_DIR/$file"
 done
 
@@ -143,8 +154,14 @@ fi
 
 backup_file /opt/scripts/adguard-vpn-trigger.sh
 backup_file "$SERVICE"
-backup_file /opt/etc/adguard-vpn-trigger.conf
+backup_file "$CONFIG_FILE"
 backup_file /opt/bin/adguard-vpn-selftest
+
+HOOK_NAME="50-adguard-vpn-trigger.sh"
+HOOK_DIRS="/opt/etc/ndm/ifstatechanged.d /opt/etc/ndm/neighbour.d"
+for dir in $HOOK_DIRS; do
+    [ -e "$dir/$HOOK_NAME" ] && { cp -p "$dir/$HOOK_NAME" "$BACKUP_DIR/${dir##*/}-$HOOK_NAME" || die "failed to back up $dir/$HOOK_NAME"; }
+done
 
 # Disable the all-clients hooks from the official example if they exist. They
 # conflict with Policy0 selection; copies remain in the timestamped backup.
@@ -164,18 +181,27 @@ cp "$SCRIPT_DIR/S99adguard-vpn-trigger" "$SERVICE" || die "failed to install sta
 cp "$SCRIPT_DIR/adguard-vpn-selftest.sh" /opt/bin/adguard-vpn-selftest || die "failed to install self-test"
 chmod 755 /opt/scripts/adguard-vpn-trigger.sh "$SERVICE" /opt/bin/adguard-vpn-selftest || die "failed to set executable permissions"
 
-CONFIG_TMP="/opt/etc/adguard-vpn-trigger.conf.tmp"
+for dir in $HOOK_DIRS; do
+    mkdir -p "$dir" || die "failed to create $dir"
+    cp "$SCRIPT_DIR/ndm-hook.sh" "$dir/$HOOK_NAME" || die "failed to install hook into $dir"
+    chmod 755 "$dir/$HOOK_NAME" || die "failed to set hook permissions"
+done
+
+CONFIG_TMP="$CONFIG_FILE.tmp"
 {
     echo "SWITCH_IF=\"$SWITCH_IF\""
     echo "POLICY_NAME=\"$POLICY_NAME\""
     echo "TABLE_ID=\"$TABLE_ID\""
     echo "RULE_PRIORITY=\"$RULE_PRIORITY\""
     echo "ADGUARD_HOME=\"$ADGUARD_HOME\""
-    echo "HEALTHCHECK_IP=\"$HEALTHCHECK_IP\""
+    echo "HEALTHCHECK_URL=\"$HEALTHCHECK_URL\""
+    echo "HEALTHCHECK_PARALLEL=\"$HEALTHCHECK_PARALLEL\""
+    echo "ADGUARD_LOG_MAX_KB=\"$ADGUARD_LOG_MAX_KB\""
+    echo "PROTOCOLS=\"$PROTOCOLS\""
     echo "INTERVAL=\"$INTERVAL\""
 } > "$CONFIG_TMP"
 chmod 600 "$CONFIG_TMP" || die "failed to protect configuration"
-mv "$CONFIG_TMP" /opt/etc/adguard-vpn-trigger.conf || die "failed to install configuration"
+mv "$CONFIG_TMP" "$CONFIG_FILE" || die "failed to install configuration"
 
 if [ ! -e /dev/net/tun ]; then
     echo "WARNING: /dev/net/tun is missing; install/enable the Keenetic VPN components" >&2
